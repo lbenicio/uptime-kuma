@@ -1,4 +1,5 @@
 const fs = require("fs");
+const fsAsync = fs.promises;
 const { R } = require("redbean-node");
 const { setSetting, setting } = require("./util-server");
 const { log, sleep } = require("../src/util");
@@ -11,14 +12,14 @@ const { UptimeCalculator } = require("./uptime-calculator");
 const dayjs = require("dayjs");
 const { SimpleMigrationServer } = require("./utils/simple-migration-server");
 const KumaColumnCompiler = require("./utils/knex/lib/dialects/mysql2/schema/mysql2-columncompiler");
+const SqlString = require("sqlstring");
 
 /**
  * Database & App Data Folder
  */
 class Database {
-
     /**
-     * Boostrap database for SQLite
+     * Bootstrap database for SQLite
      * @type {string}
      */
     static templatePath = "./db/kuma.db";
@@ -87,7 +88,7 @@ class Database {
         "patch-added-mqtt-monitor.sql": true,
         "patch-add-clickable-status-page-link.sql": true,
         "patch-add-sqlserver-monitor.sql": true,
-        "patch-add-other-auth.sql": { parents: [ "patch-monitor-basic-auth.sql" ] },
+        "patch-add-other-auth.sql": { parents: ["patch-monitor-basic-auth.sql"] },
         "patch-grpc-monitor.sql": true,
         "patch-add-radius-monitor.sql": true,
         "patch-monitor-add-resend-interval.sql": true,
@@ -136,24 +137,24 @@ class Database {
         Database.dataDir = process.env.DATA_DIR || args["data-dir"] || "./data/";
 
         Database.sqlitePath = path.join(Database.dataDir, "kuma.db");
-        if (! fs.existsSync(Database.dataDir)) {
+        if (!fs.existsSync(Database.dataDir)) {
             fs.mkdirSync(Database.dataDir, { recursive: true });
         }
 
         Database.uploadDir = path.join(Database.dataDir, "upload/");
 
-        if (! fs.existsSync(Database.uploadDir)) {
+        if (!fs.existsSync(Database.uploadDir)) {
             fs.mkdirSync(Database.uploadDir, { recursive: true });
         }
 
         // Create screenshot dir
         Database.screenshotDir = path.join(Database.dataDir, "screenshots/");
-        if (! fs.existsSync(Database.screenshotDir)) {
+        if (!fs.existsSync(Database.screenshotDir)) {
             fs.mkdirSync(Database.screenshotDir, { recursive: true });
         }
 
         Database.dockerTLSDir = path.join(Database.dataDir, "docker-tls/");
-        if (! fs.existsSync(Database.dockerTLSDir)) {
+        if (!fs.existsSync(Database.dockerTLSDir)) {
             fs.mkdirSync(Database.dockerTLSDir, { recursive: true });
         }
 
@@ -164,7 +165,7 @@ class Database {
      * Read the database config
      * @throws {Error} If the config is invalid
      * @typedef {string|undefined} envString
-     * @returns {{type: "sqlite"} | {type:envString, hostname:envString, port:envString, database:envString, username:envString, password:envString}} Database config
+     * @returns {{type: "sqlite"} | {type:envString, hostname:envString, port:envString, database:envString, username:envString, password:envString, socketPath:envString}} Database config
      */
     static readDBConfig() {
         let dbConfig;
@@ -184,7 +185,7 @@ class Database {
 
     /**
      * @typedef {string|undefined} envString
-     * @param {{type: "sqlite"} | {type:envString, hostname:envString, port:envString, database:envString, username:envString, password:envString}} dbConfig the database configuration that should be written
+     * @param {{type: "sqlite"} | {type:envString, hostname:envString, port:envString, database:envString, username:envString, password:envString, socketPath:envString}} dbConfig the database configuration that should be written
      * @returns {void}
      */
     static writeDBConfig(dbConfig) {
@@ -221,23 +222,63 @@ class Database {
 
         let config = {};
 
+        let parsedMaxPoolConnections = parseInt(process.env.UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS);
+
+        if (!process.env.UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS) {
+            parsedMaxPoolConnections = 10;
+        } else if (Number.isNaN(parsedMaxPoolConnections)) {
+            log.warn(
+                "db",
+                "Max database connections defaulted to 10 because UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS was invalid."
+            );
+            parsedMaxPoolConnections = 10;
+        } else if (parsedMaxPoolConnections < 1) {
+            log.warn(
+                "db",
+                "Max database connections defaulted to 10 because UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS was less than 1."
+            );
+            parsedMaxPoolConnections = 10;
+        } else if (parsedMaxPoolConnections > 100) {
+            log.warn(
+                "db",
+                "Max database connections capped to 100 because Mysql/Mariadb connections are heavy. consider using a proxy like ProxySQL or MaxScale."
+            );
+            parsedMaxPoolConnections = 100;
+        }
+
         let mariadbPoolConfig = {
             min: 0,
-            max: 10,
+            max: parsedMaxPoolConnections,
             idleTimeoutMillis: 30000,
         };
 
         log.info("db", `Database Type: ${dbConfig.type}`);
 
         if (dbConfig.type === "sqlite") {
-
-            if (! fs.existsSync(Database.sqlitePath)) {
+            if (!fs.existsSync(Database.sqlitePath)) {
                 log.info("server", "Copying Database");
                 fs.copyFileSync(Database.templatePath, Database.sqlitePath);
             }
 
             const Dialect = require("knex/lib/dialects/sqlite3/index.js");
             Dialect.prototype._driver = () => require("@louislam/sqlite3");
+
+            // SQLite is actually multiple connections for WAL mode, so we can set it to a higher number.
+            // See: https://github.com/knex/knex/issues/3176#issuecomment-3389054899
+            let poolConfig = {
+                min: 0,
+                max: 20,
+            };
+
+            // Default is still single connection.
+            // Multiple connection could run into "SQLITE_BUSY: database is locked" error.
+            if (process.env.UPTIME_KUMA_SQLITE_SINGLE_CONNECTION !== "false") {
+                log.info("db", "Using single connection for SQLite");
+                poolConfig = {
+                    min: 1,
+                    max: 1,
+                };
+            }
 
             config = {
                 client: Dialect,
@@ -247,26 +288,37 @@ class Database {
                 },
                 useNullAsDefault: true,
                 pool: {
-                    min: 1,
-                    max: 1,
-                    idleTimeoutMillis: 120 * 1000,
-                    propagateCreateError: false,
+                    ...poolConfig,
                     acquireTimeoutMillis: acquireConnectionTimeout,
-                }
+                    afterCreate: (rawConn, done) => {
+                        this.initSQLite(rawConn, testMode)
+                            .then(() => done(undefined, rawConn))
+                            .catch((err) => done(err, rawConn));
+                    },
+                },
             };
         } else if (dbConfig.type === "mariadb") {
-            if (!/^\w+$/.test(dbConfig.dbName)) {
-                throw Error("Invalid database name. A database name can only consist of letters, numbers and underscores");
-            }
-
             const connection = await mysql.createConnection({
                 host: dbConfig.hostname,
                 port: dbConfig.port,
                 user: dbConfig.username,
                 password: dbConfig.password,
+                socketPath: dbConfig.socketPath,
+                ...(dbConfig.ssl
+                    ? {
+                          ssl: {
+                              rejectUnauthorized: true,
+                              ...(dbConfig.ca && dbConfig.ca.trim() !== "" ? { ca: [dbConfig.ca] } : {}),
+                          },
+                      }
+                    : {}),
             });
 
-            await connection.execute("CREATE DATABASE IF NOT EXISTS " + dbConfig.dbName + " CHARACTER SET utf8mb4");
+            // Set to true, so for example "uptime.kuma", becomes `uptime.kuma`, not `uptime`.`kuma`
+            // Doc: https://github.com/mysqljs/sqlstring?tab=readme-ov-file#escaping-query-identifiers
+            const escapedDBName = SqlString.escapeId(dbConfig.dbName, true);
+
+            await connection.execute("CREATE DATABASE IF NOT EXISTS " + escapedDBName + " CHARACTER SET utf8mb4");
             connection.end();
 
             config = {
@@ -277,6 +329,7 @@ class Database {
                     user: dbConfig.username,
                     password: dbConfig.password,
                     database: dbConfig.dbName,
+                    socketPath: dbConfig.socketPath,
                     timezone: "Z",
                     typeCast: function (field, next) {
                         if (field.type === "DATETIME") {
@@ -285,6 +338,14 @@ class Database {
                         }
                         return next();
                     },
+                    ...(dbConfig.ssl
+                        ? {
+                              ssl: {
+                                  rejectUnauthorized: true,
+                                  ...(dbConfig.ca && dbConfig.ca.trim() !== "" ? { ca: [dbConfig.ca] } : {}),
+                              },
+                          }
+                        : {}),
                 },
                 pool: mariadbPoolConfig,
             };
@@ -338,40 +399,48 @@ class Database {
         }
 
         if (dbConfig.type === "sqlite") {
-            await this.initSQLite(testMode, noLog);
+            if (!noLog) {
+                log.debug("db", "SQLite config:");
+                log.debug("db", await R.getAll("PRAGMA journal_mode"));
+                log.debug("db", await R.getAll("PRAGMA cache_size"));
+                log.debug("db", "SQLite Version: " + (await R.getCell("SELECT sqlite_version()")));
+            }
         } else if (dbConfig.type.endsWith("mariadb")) {
             await this.initMariaDB();
         }
     }
 
     /**
-     @param {boolean} testMode Should the connection be started in test mode?
-     @param {boolean} noLog Should logs not be output?
-     @returns {Promise<void>}
+     * Initialize SQLite for each connection
+     * @param {any} rawConn The raw node-sqlite3 Database object
+     * @param {boolean} testMode Should the connection be started in test mode?
+     * @returns {Promise<void>}
      */
-    static async initSQLite(testMode, noLog) {
-        await R.exec("PRAGMA foreign_keys = ON");
+    static async initSQLite(rawConn, testMode) {
+        // Since rawConn.run is callback based, in order to avoid callback hell, wrap it in a promise
+        const asyncRun = (sql) => {
+            return new Promise((resolve, reject) => rawConn.run(sql, (err) => (err ? reject(err) : resolve())));
+        };
+
         if (testMode) {
             // Change to MEMORY
-            await R.exec("PRAGMA journal_mode = MEMORY");
+            await asyncRun("PRAGMA journal_mode = MEMORY");
         } else {
             // Change to WAL
-            await R.exec("PRAGMA journal_mode = WAL");
+            await asyncRun("PRAGMA journal_mode = WAL");
         }
-        await R.exec("PRAGMA cache_size = -12000");
-        await R.exec("PRAGMA auto_vacuum = INCREMENTAL");
+
+        await asyncRun("PRAGMA foreign_keys = ON");
+        await asyncRun("PRAGMA cache_size = -12000");
+        await asyncRun("PRAGMA auto_vacuum = INCREMENTAL");
+
+        // Avoid error "SQLITE_BUSY: database is locked" by allowing SQLITE to wait up to 5 seconds to do a write
+        await asyncRun("PRAGMA busy_timeout = 5000");
 
         // This ensures that an operating system crash or power failure will not corrupt the database.
         // FULL synchronous is very safe, but it is also slower.
         // Read more: https://sqlite.org/pragma.html#pragma_synchronous
-        await R.exec("PRAGMA synchronous = NORMAL");
-
-        if (!noLog) {
-            log.debug("db", "SQLite config:");
-            log.debug("db", await R.getAll("PRAGMA journal_mode"));
-            log.debug("db", await R.getAll("PRAGMA cache_size"));
-            log.debug("db", "SQLite Version: " + await R.getCell("SELECT sqlite_version()"));
-        }
+        await asyncRun("PRAGMA synchronous = NORMAL");
     }
 
     /**
@@ -422,7 +491,6 @@ class Database {
             }
 
             await this.migrateAggregateTable(port, hostname);
-
         } catch (e) {
             // Allow missing patch files for downgrade or testing pr.
             if (e.message.includes("the following files are missing:")) {
@@ -439,9 +507,7 @@ class Database {
      * TODO
      * @returns {Promise<void>}
      */
-    static async rollbackLatestPatch() {
-
-    }
+    static async rollbackLatestPatch() {}
 
     /**
      * Patch the database for SQLite
@@ -451,7 +517,7 @@ class Database {
     static async patchSqlite() {
         let version = parseInt(await setting("database_version"));
 
-        if (! version) {
+        if (!version) {
             version = 0;
         }
 
@@ -481,7 +547,10 @@ class Database {
 
                 log.error("db", ex);
                 log.error("db", "Start Uptime-Kuma failed due to issue patching the database");
-                log.error("db", "Please submit a bug report if you still encounter the problem after restart: https://github.com/louislam/uptime-kuma/issues");
+                log.error(
+                    "db",
+                    "Please submit a bug report if you still encounter the problem after restart: https://github.com/louislam/uptime-kuma/issues"
+                );
 
                 process.exit(1);
             }
@@ -502,7 +571,7 @@ class Database {
         log.debug("db", "Database Patch 2.0 Process");
         let databasePatchedFiles = await setting("databasePatchedFiles");
 
-        if (! databasePatchedFiles) {
+        if (!databasePatchedFiles) {
             databasePatchedFiles = {};
         }
 
@@ -517,13 +586,15 @@ class Database {
             if (this.patched) {
                 log.info("db", "Database Patched Successfully");
             }
-
         } catch (ex) {
             await Database.close();
 
             log.error("db", ex);
             log.error("db", "Start Uptime-Kuma failed due to issue patching the database");
-            log.error("db", "Please submit the bug report if you still encounter the problem after restart: https://github.com/louislam/uptime-kuma/issues");
+            log.error(
+                "db",
+                "Please submit the bug report if you still encounter the problem after restart: https://github.com/louislam/uptime-kuma/issues"
+            );
 
             process.exit(1);
         }
@@ -537,19 +608,18 @@ class Database {
      * @returns {Promise<void>}
      */
     static async migrateNewStatusPage() {
-
         // Fix 1.13.0 empty slug bug
         await R.exec("UPDATE status_page SET slug = 'empty-slug-recover' WHERE TRIM(slug) = ''");
 
         let title = await setting("title");
 
         if (title) {
-            console.log("Migrating Status Page");
+            log.info("database", "Migrating Status Page");
 
             let statusPageCheck = await R.findOne("status_page", " slug = 'default' ");
 
             if (statusPageCheck !== null) {
-                console.log("Migrating Status Page - Skip, default slug record is already existing");
+                log.info("database", "Migrating Status Page - Skip, default slug record is already existing");
                 return;
             }
 
@@ -559,9 +629,9 @@ class Database {
             statusPage.description = await setting("description");
             statusPage.icon = await setting("icon");
             statusPage.theme = await setting("statusPageTheme");
-            statusPage.published = !!await setting("statusPagePublished");
-            statusPage.search_engine_index = !!await setting("searchEngineIndex");
-            statusPage.show_tags = !!await setting("statusPageTags");
+            statusPage.published = !!(await setting("statusPagePublished"));
+            statusPage.search_engine_index = !!(await setting("searchEngineIndex"));
+            statusPage.show_tags = !!(await setting("statusPageTags"));
             statusPage.password = null;
 
             if (!statusPage.title) {
@@ -578,13 +648,9 @@ class Database {
 
             let id = await R.store(statusPage);
 
-            await R.exec("UPDATE incident SET status_page_id = ? WHERE status_page_id IS NULL", [
-                id
-            ]);
+            await R.exec("UPDATE incident SET status_page_id = ? WHERE status_page_id IS NULL", [id]);
 
-            await R.exec("UPDATE [group] SET status_page_id = ? WHERE status_page_id IS NULL", [
-                id
-            ]);
+            await R.exec("UPDATE [group] SET status_page_id = ? WHERE status_page_id IS NULL", [id]);
 
             await R.exec("DELETE FROM setting WHERE type = 'statusPage'");
 
@@ -595,9 +661,8 @@ class Database {
                 await setSetting("entryPage", "statusPage-default", "general");
             }
 
-            console.log("Migrating Status Page - Done");
+            log.info("database", "Migrating Status Page - Done");
         }
-
     }
 
     /**
@@ -611,13 +676,13 @@ class Database {
     static async patch2Recursion(sqlFilename, databasePatchedFiles) {
         let value = this.patchList[sqlFilename];
 
-        if (! value) {
+        if (!value) {
             log.info("db", sqlFilename + " skip");
             return;
         }
 
         // Check if patched
-        if (! databasePatchedFiles[sqlFilename]) {
+        if (!databasePatchedFiles[sqlFilename]) {
             log.info("db", sqlFilename + " is not patched");
 
             if (value.parents) {
@@ -632,7 +697,6 @@ class Database {
             await this.importSQLFile("./db/old_migrations/" + sqlFilename);
             databasePatchedFiles[sqlFilename] = true;
             log.info("db", sqlFilename + " was patched successfully");
-
         } else {
             log.debug("db", sqlFilename + " is already patched, skip");
         }
@@ -652,14 +716,15 @@ class Database {
         // Remove all comments (--)
         let lines = text.split("\n");
         lines = lines.filter((line) => {
-            return ! line.startsWith("--");
+            return !line.startsWith("--");
         });
 
         // Split statements by semicolon
         // Filter out empty line
         text = lines.join("\n");
 
-        let statements = text.split(";")
+        let statements = text
+            .split(";")
             .map((statement) => {
                 return statement.trim();
             })
@@ -707,12 +772,12 @@ class Database {
 
     /**
      * Get the size of the database (SQLite only)
-     * @returns {number} Size of database
+     * @returns {Promise<number>} Size of database
      */
-    static getSize() {
+    static async getSize() {
         if (Database.dbConfig.type === "sqlite") {
             log.debug("db", "Database.getSize()");
-            let stats = fs.statSync(Database.sqlitePath);
+            let stats = await fsAsync.stat(Database.sqlitePath);
             log.debug("db", stats);
             return stats.size;
         }
@@ -736,7 +801,7 @@ class Database {
         if (Database.dbConfig.type === "sqlite") {
             return "DATETIME('now', ? || ' hours')";
         } else {
-            return "DATE_ADD(NOW(), INTERVAL ? HOUR)";
+            return "DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? HOUR)";
         }
     }
 
@@ -756,7 +821,10 @@ class Database {
 
         // Add a setting for 2.0.0-dev users to skip this migration
         if (process.env.SET_MIGRATE_AGGREGATE_TABLE_TO_TRUE === "1") {
-            log.warn("db", "SET_MIGRATE_AGGREGATE_TABLE_TO_TRUE is set to 1, skipping aggregate table migration forever (for 2.0.0-dev users)");
+            log.warn(
+                "db",
+                "SET_MIGRATE_AGGREGATE_TABLE_TO_TRUE is set to 1, skipping aggregate table migration forever (for 2.0.0-dev users)"
+            );
             await Settings.set("migrateAggregateTableState", "migrated");
         }
 
@@ -796,11 +864,14 @@ class Database {
         `);
 
         // Stop if stat_* tables are not empty
-        for (let table of [ "stat_minutely", "stat_hourly", "stat_daily" ]) {
+        for (let table of ["stat_minutely", "stat_hourly", "stat_daily"]) {
             let countResult = await R.getRow(`SELECT COUNT(*) AS count FROM ${table}`);
             let count = countResult.count;
             if (count > 0) {
-                log.warn("db", `Aggregate table ${table} is not empty, migration will not be started (Maybe you were using 2.0.0-dev?)`);
+                log.warn(
+                    "db",
+                    `Aggregate table ${table} is not empty, migration will not be started (Maybe you were using 2.0.0-dev?)`
+                );
                 await migrationServer?.stop();
                 return;
             }
@@ -809,36 +880,38 @@ class Database {
         await Settings.set("migrateAggregateTableState", "migrating");
 
         let progressPercent = 0;
-        let part = 100 / monitors.length;
-        let i = 1;
-        for (let monitor of monitors) {
+        for (const [i, monitor] of monitors.entries()) {
             // Get a list of unique dates from the heartbeat table, using raw sql
-            let dates = await R.getAll(`
+            let dates = await R.getAll(
+                `
                 SELECT DISTINCT DATE(time) AS date
                 FROM heartbeat
                 WHERE monitor_id = ?
                 ORDER BY date ASC
-            `, [
-                monitor.monitor_id
-            ]);
+            `,
+                [monitor.monitor_id]
+            );
 
-            for (let date of dates) {
+            for (const [dateIndex, date] of dates.entries()) {
                 // New Uptime Calculator
                 let calculator = new UptimeCalculator();
                 calculator.monitorID = monitor.monitor_id;
                 calculator.setMigrationMode(true);
 
                 // Get all the heartbeats for this monitor and date
-                let heartbeats = await R.getAll(`
+                let heartbeats = await R.getAll(
+                    `
                     SELECT status, ping, time
                     FROM heartbeat
                     WHERE monitor_id = ?
                     AND DATE(time) = ?
                     ORDER BY time ASC
-                `, [ monitor.monitor_id, date.date ]);
+                `,
+                    [monitor.monitor_id, date.date]
+                );
 
                 if (heartbeats.length > 0) {
-                    msg = `[DON'T STOP] Migrating monitor data ${monitor.monitor_id} - ${date.date} [${progressPercent.toFixed(2)}%][${i}/${monitors.length}]`;
+                    msg = `[DON'T STOP] Migrating monitor ${monitor.monitor_id}s' (${i + 1} of ${monitors.length} total) data - ${date.date} - total migration progress ${progressPercent.toFixed(2)}%`;
                     log.info("db", msg);
                     migrationServer?.update(msg);
                 }
@@ -847,15 +920,14 @@ class Database {
                     await calculator.update(heartbeat.status, parseFloat(heartbeat.ping), dayjs(heartbeat.time));
                 }
 
-                progressPercent += (Math.round(part / dates.length * 100) / 100);
+                // Calculate progress: (current_monitor_index + relative_date_progress) / total_monitors
+                progressPercent = ((i + (dateIndex + 1) / dates.length) / monitors.length) * 100;
 
                 // Lazy to fix the floating point issue, it is acceptable since it is just a progress bar
                 if (progressPercent > 100) {
                     progressPercent = 100;
                 }
             }
-
-            i++;
         }
 
         msg = "Clearing non-important heartbeats";
@@ -886,7 +958,8 @@ class Database {
             if (detailedLog) {
                 log.info("db", "Deleting non-important heartbeats for monitor " + monitor.id);
             }
-            await R.exec(`
+            await R.exec(
+                `
                 DELETE FROM heartbeat
                 WHERE monitor_id = ?
                 AND important = 0
@@ -900,15 +973,11 @@ class Database {
                         LIMIT ?
                     )  AS limited_ids
                 )
-            `, [
-                monitor.id,
-                -24,
-                monitor.id,
-                100,
-            ]);
+            `,
+                [monitor.id, -24, monitor.id, 100]
+            );
         }
     }
-
 }
 
 module.exports = Database;
